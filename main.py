@@ -1,358 +1,102 @@
 
-"""PTT Connect Radio Gateway — Windows Copper Edition.
+"""PTT Connect Radio Gateway: Windows audio test alongside installed TeamSpeak.
 
-TeamSpeak-verbindingstest via geïnstalleerde TeamSpeak-client.
-De lokale audiometer en VOX zijn nog niet gekoppeld aan TeamSpeak.
+This application does NOT send audio to TeamSpeak. Its test tone uses the selected
+output device; the audio monitor uses the selected input device. Configure the
+same devices and voice activation in the installed TeamSpeak client.
 """
-
 import json
-import os
 import math
+import os
 import queue
+import threading
 import tkinter as tk
-
 from pathlib import Path
 from tkinter import ttk, messagebox
 from urllib.parse import urlencode
 
-try:
-    import sounddevice as sd
-except ImportError:
-    sd = None
+import numpy as np
+import sounddevice as sd
 
-
-APP = "PTT Connect Radio Gateway"
-
-BG = "#17191c"
-SIDE = "#111315"
-PANEL = "#262a2e"
-COPPER = "#da812f"
-TEXT = "#f6f1e9"
-SUB = "#b5aea5"
-GREEN = "#53cb85"
-
-SERVERS = {
-    "TG-103 Voorburg": "ptt.mijnts3.nl",
-    "TG-108 Heerlen": "heerlen.mijnts3.nl"
-}
-
-SETTINGS = (
-    Path(os.getenv("APPDATA") or Path.home())
-    / "PTTConnectRadioGateway"
-    / "settings.json"
-)
-
-DEFAULT = {
-    "server": "TG-103 Voorburg",
-    "nickname": "Radio Gateway",
-    "channel": "",
-    "voice_port": 9987,
-    "input_device": "",
-    "output_device": "",
-    "gain": 100,
-    "threshold": 12,
-    "attack_ms": 150,
-    "release_ms": 950,
-    "mode": "RX/TX"
-}
+SERVERS = {"TG-103 Voorburg": "ptt.mijnts3.nl", "TG-108 Heerlen": "heerlen.mijnts3.nl"}
+PATH = Path(os.getenv("APPDATA", str(Path.home()))) / "PTTConnectRadioGateway" / "settings.json"
+COL = {"bg": "#18191c", "side": "#111315", "card": "#292c31", "accent": "#dc8a39", "fg": "#f5eee6", "sub": "#b8aea6", "ok": "#61cf91"}
+DEFAULT = {"server": "TG-103 Voorburg", "nickname": "Radio Gateway", "channel": "", "port": "9987", "input": "", "output": "", "gain": 100, "threshold": 12, "attack": 150, "release": 900, "mode": "RX/TX"}
 
 
 def load():
     try:
-        saved = json.loads(
-            SETTINGS.read_text(encoding="utf8")
-        )
-
-        return {
-            **DEFAULT,
-            **{
-                k: v
-                for k, v in saved.items()
-                if k in DEFAULT
-            }
-        }
-
+        obj = json.loads(PATH.read_text(encoding="utf-8"))
+        return {**DEFAULT, **{k: v for k, v in obj.items() if k in DEFAULT}}
     except (OSError, ValueError, TypeError):
-        return DEFAULT.copy()
+        return dict(DEFAULT)
 
 
-class App:
-
+class GUI:
     def __init__(self, root):
         self.root = root
-
-        self.root.title(
-            APP + " — Copper Edition"
-        )
-
-        self.root.geometry("1070x735")
-        self.root.minsize(900, 600)
-        self.root.configure(bg=BG)
-
-        self.vars = {
-            k: tk.StringVar(value=str(v))
-            for k, v in load().items()
-        }
-
-        self.pages = {}
-        self.nav = {}
-
-        self.inputs = {}
-        self.outputs = {}
-
+        self.root.title("PTT Connect Radio Gateway — Copper Audio Test")
+        self.root.geometry("1100x740")
+        self.root.minsize(920, 610)
+        self.root.configure(bg=COL["bg"])
+        self.v = {k: tk.StringVar(value=str(val)) for k, val in load().items()}
+        self.devices_in, self.devices_out = {}, {}
+        self.events = queue.Queue(maxsize=8)
         self.stream = None
-        self.audio_q = queue.Queue(maxsize=15)
-
-        self.level = 0.0
         self.vox = False
-        self.above = 0
-        self.below = 0
+        self.high_ms = self.low_ms = 0.0
+        self.level = 0.0
+        self.peak = 0.0
+        self.pages, self.buttons = {}, {}
         self.closed = False
-
-        self._style()
-        self._layout()
+        self.tone_running = False
+        self.setup()
         self.refresh_devices()
-
-        self.show("Overzicht")
-
+        self.page("Overzicht")
         self.root.after(70, self.tick)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.root.protocol(
-            "WM_DELETE_WINDOW",
-            self.close
-        )
-
-    # ======================================
-    # STIJL
-    # ======================================
-
-    def _style(self):
+    def setup(self):
         st = ttk.Style(self.root)
         st.theme_use("clam")
-
-        st.configure(
-            "TButton",
-            padding=(12, 8),
-            font=("Segoe UI", 10, "bold")
-        )
-
-        st.configure(
-            "Copper.TButton",
-            foreground="white",
-            background="#b96522"
-        )
-
-        st.map(
-            "Copper.TButton",
-            background=[("active", COPPER)]
-        )
-
-        st.configure(
-            "TEntry",
-            padding=6,
-            fieldbackground="#faf7f0"
-        )
-
-        st.configure(
-            "TCombobox",
-            padding=6
-        )
-
-        st.configure(
-            "Copper.Horizontal.TProgressbar",
-            background=GREEN,
-            troughcolor="#49382a"
-        )
-
-    # ======================================
-    # HOOFDVENSTER
-    # ======================================
-
-    def _layout(self):
-        side = tk.Frame(
-            self.root,
-            bg=SIDE,
-            width=225
-        )
-
-        side.pack(
-            side="left",
-            fill="y"
-        )
-
+        st.configure("TButton", padding=(12, 8))
+        st.configure("Copper.TButton", background="#ad6128", foreground="white")
+        st.map("Copper.TButton", background=[("active", COL["accent"])])
+        st.configure("TCombobox", padding=6)
+        st.configure("TEntry", padding=6)
+        st.configure("Bar.Horizontal.TProgressbar", background=COL["ok"], troughcolor="#46372b")
+        base = tk.Frame(self.root, bg=COL["bg"])
+        base.pack(fill="both", expand=True)
+        side = tk.Frame(base, bg=COL["side"], width=220)
+        side.pack(side="left", fill="y")
         side.pack_propagate(False)
-
-        tk.Label(
-            side,
-            text="◉ PTT Connect",
-            bg=SIDE,
-            fg=TEXT,
-            font=("Segoe UI", 18, "bold")
-        ).pack(
-            anchor="w",
-            padx=16,
-            pady=(24, 0)
-        )
-
-        tk.Label(
-            side,
-            text="RADIO GATEWAY",
-            bg=SIDE,
-            fg="#ffb347",
-            font=("Segoe UI", 10, "bold")
-        ).pack(
-            anchor="w",
-            padx=20,
-            pady=(0, 28)
-        )
-
-        menu_items = [
-            "Overzicht",
-            "TeamSpeak",
-            "Audioapparaten",
-            "VOX-instellingen",
-            "Radiomodus",
-            "Systeem"
-        ]
-
-        for name in menu_items:
-            btn = tk.Button(
-                side,
-                text="  " + name,
-                bg=SIDE,
-                fg=TEXT,
-                bd=0,
-                padx=13,
-                pady=13,
-                anchor="w",
-                font=("Segoe UI", 11),
-                activebackground="#885022",
-                activeforeground="white",
-                command=lambda n=name: self.show(n)
-            )
-
-            btn.pack(
-                fill="x",
-                padx=8,
-                pady=3
-            )
-
-            self.nav[name] = btn
-
-        right = tk.Frame(
-            self.root,
-            bg=BG
-        )
-
-        right.pack(
-            fill="both",
-            expand=True
-        )
-
-        header = tk.Frame(
-            right,
-            bg="#24272a",
-            height=85
-        )
-
-        header.pack(fill="x")
-        header.pack_propagate(False)
-
-        self.heading = tk.Label(
-            header,
-            bg="#24272a",
-            fg=TEXT,
-            font=("Segoe UI", 21, "bold")
-        )
-
-        self.heading.pack(
-            anchor="w",
-            padx=24,
-            pady=(15, 0)
-        )
-
-        tk.Label(
-            header,
-            text=(
-                "Windows • TeamSpeak-verbindingstest "
-                "• Copper Edition"
-            ),
-            bg="#24272a",
-            fg="#ffc47d"
-        ).pack(
-            anchor="w",
-            padx=26
-        )
-
-        wrapper = tk.Frame(
-            right,
-            bg=BG
-        )
-
-        wrapper.pack(
-            fill="both",
-            expand=True
-        )
-
-        canvas = tk.Canvas(
-            wrapper,
-            bg=BG,
-            highlightthickness=0
-        )
-
-        scroll = ttk.Scrollbar(
-            wrapper,
-            orient="vertical",
-            command=canvas.yview
-        )
-
-        canvas.configure(
-            yscrollcommand=scroll.set
-        )
-
-        scroll.pack(
-            side="right",
-            fill="y"
-        )
-
-        canvas.pack(
-            side="left",
-            fill="both",
-            expand=True
-        )
-
-        body = tk.Frame(
-            canvas,
-            bg=BG
-        )
-
-        window = canvas.create_window(
-            (0, 0),
-            anchor="nw",
-            window=body
-        )
-
-        body.bind(
-            "<Configure>",
-            lambda _: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
-        )
-
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfigure(
-                window,
-                width=e.width
-            )
-        )
-
-        for name in self.nav:
-            self.pages[name] = tk.Frame(
-                body,
-                bg=BG
-            )
-
+        tk.Label(side, text="◉ PTT Connect", bg=COL["side"], fg=COL["fg"], font=("Segoe UI", 18, "bold")).pack(padx=16, pady=(24, 3), anchor="w")
+        tk.Label(side, text="RADIO GATEWAY", bg=COL["side"], fg=COL["accent"], font=("Segoe UI", 11, "bold")).pack(padx=18, pady=(0, 25), anchor="w")
+        for name in ("Overzicht", "TeamSpeak", "Audioapparaten", "VOX-instellingen", "Radiomodus", "Systeem"):
+            b = tk.Button(side, text="  " + name, anchor="w", bg=COL["side"], fg=COL["fg"], bd=0, relief="flat", padx=10, pady=13, font=("Segoe UI", 11), command=lambda n=name: self.page(n))
+            b.pack(fill="x", padx=7, pady=2)
+            self.buttons[name] = b
+        main = tk.Frame(base, bg=COL["bg"])
+        main.pack(side="left", fill="both", expand=True)
+        head = tk.Frame(main, bg="#24272a", height=90)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        self.title = tk.Label(head, bg="#24272a", fg=COL["fg"], font=("Segoe UI", 21, "bold"))
+        self.title.pack(anchor="w", padx=24, pady=(13, 0))
+        tk.Label(head, text="Windows • TeamSpeak externe client • USB audio test", bg="#24272a", fg=COL["accent"]).pack(anchor="w", padx=26)
+        outer = tk.Frame(main, bg=COL["bg"])
+        outer.pack(fill="both", expand=True)
+        cv = tk.Canvas(outer, bg=COL["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        scr.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        cv.configure(yscrollcommand=scr.set)
+        holder = tk.Frame(cv, bg=COL["bg"])
+        win = cv.create_window((0, 0), anchor="nw", window=holder)
+        holder.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        for name in self.buttons:
+            self.pages[name] = tk.Frame(holder, bg=COL["bg"])
         self.overview()
         self.teamspeak()
         self.audio()
@@ -360,930 +104,240 @@ class App:
         self.mode_page()
         self.system()
 
-    # ======================================
-    # ALGEMENE COMPONENTEN
-    # ======================================
+    def card(self, name, title):
+        x = tk.Frame(self.pages[name], bg=COL["card"], padx=20, pady=16, highlightthickness=1, highlightbackground="#66503c")
+        x.pack(fill="x", padx=20, pady=(15, 0))
+        tk.Label(x, text=title, bg=COL["card"], fg=COL["accent"], font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 12))
+        return x
 
-    def card(self, page, title):
-        frame = tk.Frame(
-            page,
-            bg=PANEL,
-            highlightthickness=1,
-            highlightbackground="#76512f",
-            padx=20,
-            pady=18
-        )
+    def label(self, parent, text):
+        tk.Label(parent, text=text, bg=COL["card"], fg=COL["sub"], justify="left", wraplength=690).pack(anchor="w", pady=7)
 
-        frame.pack(
-            fill="x",
-            padx=20,
-            pady=(16, 0)
-        )
+    def entry(self, box, title, key):
+        r = tk.Frame(box, bg=COL["card"])
+        r.pack(fill="x", pady=5)
+        tk.Label(r, text=title, width=19, anchor="w", bg=COL["card"], fg=COL["fg"]).pack(side="left")
+        ttk.Entry(r, textvariable=self.v[key]).pack(side="left", fill="x", expand=True)
 
-        tk.Label(
-            frame,
-            text=title,
-            bg=PANEL,
-            fg="#ffb347",
-            font=("Segoe UI", 14, "bold")
-        ).pack(
-            anchor="w",
-            pady=(0, 12)
-        )
-
-        return frame
-
-    def note(self, page, txt, color=SUB):
-        tk.Label(
-            page,
-            text=txt,
-            bg=PANEL,
-            fg=color,
-            font=("Segoe UI", 10),
-            justify="left",
-            wraplength=690
-        ).pack(
-            anchor="w",
-            pady=7
-        )
-
-    def entry(self, page, label, key):
-        line = tk.Frame(
-            page,
-            bg=PANEL
-        )
-
-        line.pack(
-            fill="x",
-            pady=6
-        )
-
-        tk.Label(
-            line,
-            text=label,
-            bg=PANEL,
-            fg=TEXT,
-            width=19,
-            anchor="w"
-        ).pack(side="left")
-
-        ttk.Entry(
-            line,
-            textvariable=self.vars[key]
-        ).pack(
-            side="left",
-            fill="x",
-            expand=True
-        )
-
-    def slider(self, parent, title, key, low, high):
-        line = tk.Frame(
-            parent,
-            bg=PANEL
-        )
-
-        line.pack(
-            fill="x",
-            pady=5
-        )
-
-        tk.Label(
-            line,
-            text=title,
-            bg=PANEL,
-            fg=TEXT,
-            width=22,
-            anchor="w"
-        ).pack(side="left")
-
-        scale = tk.Scale(
-            line,
-            from_=low,
-            to=high,
-            orient="horizontal",
-            length=300,
-            bg=PANEL,
-            fg=TEXT,
-            troughcolor="#b96522",
-            highlightthickness=0,
-            command=lambda value, k=key:
-                self.vars[k].set(str(int(float(value))))
-        )
-
-        scale.set(
-            int(self.vars[key].get())
-        )
-
-        scale.pack(
-            side="left",
-            fill="x",
-            expand=True
-        )
-
-    # ======================================
-    # OVERZICHT
-    # ======================================
+    def slider(self, box, title, key, lo, hi):
+        r = tk.Frame(box, bg=COL["card"])
+        r.pack(fill="x", pady=5)
+        tk.Label(r, text=title, width=22, anchor="w", bg=COL["card"], fg=COL["fg"]).pack(side="left")
+        s = tk.Scale(r, from_=lo, to=hi, orient="horizontal", resolution=1, bg=COL["card"], fg=COL["fg"], troughcolor="#ad6128", highlightthickness=0, command=lambda val, k=key: self.v[k].set(str(int(float(val)))))
+        s.set(int(float(self.v[key].get())))
+        s.pack(side="left", fill="x", expand=True)
 
     def overview(self):
-        box = self.card(
-            self.pages["Overzicht"],
-            "Live audio — ingangstest"
-        )
-
-        self.meter = ttk.Progressbar(
-            box,
-            style="Copper.Horizontal.TProgressbar",
-            maximum=100
-        )
-
-        self.meter.pack(
-            fill="x",
-            pady=10
-        )
-
-        self.level_label = tk.Label(
-            box,
-            text="Niveau: 0,0% | VOX: uit",
-            bg=PANEL,
-            fg=GREEN,
-            font=("Segoe UI", 12, "bold")
-        )
-
-        self.level_label.pack(anchor="w")
-
-        self.test_button = ttk.Button(
-            box,
-            text="Start audiotest",
-            style="Copper.TButton",
-            command=self.toggle_audio
-        )
-
-        self.test_button.pack(
-            anchor="w",
-            pady=12
-        )
-
-        self.note(
-            box,
-            "De audiometer en VOX zijn lokaal. "
-            "Dit is nog geen zelfstandige TeamSpeak-gateway."
-        )
-
-        status = self.card(
-            self.pages["Overzicht"],
-            "Verbindingsstatus"
-        )
-
-        self.note(
-            status,
-            "TeamSpeak kan worden geopend met de "
-            "geïnstalleerde TeamSpeak-client."
-        )
-
-        self.note(
-            status,
-            "Een zelfstandige TeamSpeak-audioconnector "
-            "bouwen we in een volgende stap."
-        )
-
-    # ======================================
-    # TEAMSPEAK
-    # ======================================
+        b = self.card("Overzicht", "Live audio-ingang en VOX")
+        self.meter = ttk.Progressbar(b, maximum=100, style="Bar.Horizontal.TProgressbar")
+        self.meter.pack(fill="x", pady=10)
+        self.meter_label = tk.Label(b, text="Niveau: 0% | VOX: uit", bg=COL["card"], fg=COL["ok"], font=("Segoe UI", 12, "bold"))
+        self.meter_label.pack(anchor="w")
+        self.monitor_btn = ttk.Button(b, text="Start audiotest", style="Copper.TButton", command=self.toggle_monitor)
+        self.monitor_btn.pack(anchor="w", pady=14)
+        self.label(b, "De meter en VOX zijn een lokale test: er wordt niets naar TeamSpeak gestuurd.")
+        c = self.card("Overzicht", "Status")
+        self.label(c, "TeamSpeak-spraak loopt via de afzonderlijk geïnstalleerde TeamSpeak-client.")
+        self.label(c, "Een zelfstandige TeamSpeak-audiobrug moet nog worden ontwikkeld.")
 
     def teamspeak(self):
-        box = self.card(
-            self.pages["TeamSpeak"],
-            "TeamSpeak 3 — Handmatig verbinden"
-        )
-
-        self.note(
-            box,
-            "Kies TG-103 Voorburg of TG-108 Heerlen."
-        )
-
-        ttk.Combobox(
-            box,
-            textvariable=self.vars["server"],
-            values=list(SERVERS),
-            state="readonly"
-        ).pack(
-            fill="x",
-            pady=8
-        )
-
-        self.entry(
-            box,
-            "Gebruikersnaam",
-            "nickname"
-        )
-
-        self.entry(
-            box,
-            "Kanaalnaam (optioneel)",
-            "channel"
-        )
-
-        self.entry(
-            box,
-            "Spraakpoort",
-            "voice_port"
-        )
-
-        self.note(
-            box,
-            "Vul eventueel de exacte kanaalnaam in. "
-            "Een beveiligd kanaal kan een wachtwoord vragen."
-        )
-
-        row = tk.Frame(
-            box,
-            bg=PANEL
-        )
-
-        row.pack(
-            anchor="w",
-            pady=12
-        )
-
-        ttk.Button(
-            row,
-            text="Verbinden via TeamSpeak",
-            style="Copper.TButton",
-            command=self.connect
-        ).pack(
-            side="left",
-            padx=(0, 8)
-        )
-
-        ttk.Button(
-            row,
-            text="Instellingen bewaren",
-            command=self.save
-        ).pack(side="left")
-
-        self.ts_status = tk.Label(
-            box,
-            text="Nog niet gestart",
-            bg=PANEL,
-            fg="#ffb347",
-            justify="left",
-            wraplength=680
-        )
-
-        self.ts_status.pack(
-            anchor="w",
-            pady=8
-        )
-
-        self.note(
-            box,
-            "Dit opent de geïnstalleerde TeamSpeak-app "
-            "op Windows. Verbreken doe je voorlopig "
-            "in TeamSpeak zelf.",
-            "#ffb347"
-        )
-
-    # ======================================
-    # AUDIOAPPARATEN
-    # ======================================
+        b = self.card("TeamSpeak", "Handmatig verbinden met TeamSpeak")
+        ttk.Combobox(b, textvariable=self.v["server"], values=list(SERVERS), state="readonly").pack(fill="x", pady=7)
+        self.entry(b, "Gebruikersnaam", "nickname")
+        self.entry(b, "Kanaalnaam (optioneel)", "channel")
+        self.entry(b, "Spraakpoort", "port")
+        ttk.Button(b, text="Verbinden via TeamSpeak", style="Copper.TButton", command=self.connect).pack(anchor="w", pady=12)
+        self.ts_label = tk.Label(b, text="TeamSpeak niet vanuit deze app geopend", bg=COL["card"], fg=COL["accent"], wraplength=670)
+        self.ts_label.pack(anchor="w")
+        self.label(b, "Gebruik in TeamSpeak zelf de juiste opname- en afspeelapparaten en de ingebouwde spraakactivatie.")
+        self.label(b, "Er is nog geen rechtstreekse audioverbinding met onze app.")
 
     def audio(self):
-        box = self.card(
-            self.pages["Audioapparaten"],
-            "Interne of USB-geluidskaart"
-        )
-
-        audio_options = [
-            (
-                "Audio-ingang",
-                "input_device",
-                "in_combo"
-            ),
-            (
-                "Audio-uitgang",
-                "output_device",
-                "out_combo"
-            )
-        ]
-
-        for title, key, prop in audio_options:
-            line = tk.Frame(
-                box,
-                bg=PANEL
-            )
-
-            line.pack(
-                fill="x",
-                pady=8
-            )
-
-            tk.Label(
-                line,
-                text=title,
-                bg=PANEL,
-                fg=TEXT,
-                width=19,
-                anchor="w"
-            ).pack(side="left")
-
-            combo = ttk.Combobox(
-                line,
-                textvariable=self.vars[key],
-                state="readonly"
-            )
-
-            combo.pack(
-                side="left",
-                fill="x",
-                expand=True
-            )
-
-            setattr(
-                self,
-                prop,
-                combo
-            )
-
-        ttk.Button(
-            box,
-            text="Geluidskaarten vernieuwen",
-            command=self.refresh_devices
-        ).pack(
-            anchor="w",
-            pady=8
-        )
-
-        self.slider(
-            box,
-            "Meetversterking (%)",
-            "gain",
-            0,
-            200
-        )
-
-        self.note(
-            box,
-            "De gekozen ingang werkt voor de lokale "
-            "audiotest. TeamSpeak gebruikt voorlopig "
-            "zijn eigen geluidsinstellingen."
-        )
-
-        ttk.Button(
-            box,
-            text="Instellingen bewaren",
-            command=self.save
-        ).pack(
-            anchor="w",
-            pady=10
-        )
-
-    # ======================================
-    # VOX-INSTELLINGEN
-    # ======================================
+        b = self.card("Audioapparaten", "Windows / USB-geluidskaart")
+        for title, key, attr in (("Audio-ingang", "input", "combo_in"), ("Audio-uitgang", "output", "combo_out")):
+            r = tk.Frame(b, bg=COL["card"])
+            r.pack(fill="x", pady=6)
+            tk.Label(r, text=title, width=19, anchor="w", bg=COL["card"], fg=COL["fg"]).pack(side="left")
+            cb = ttk.Combobox(r, textvariable=self.v[key], state="readonly")
+            cb.pack(side="left", fill="x", expand=True)
+            setattr(self, attr, cb)
+        ttk.Button(b, text="Geluidskaarten vernieuwen", command=self.refresh_devices).pack(anchor="w", pady=12)
+        self.slider(b, "Meetversterking (%)", "gain", 0, 200)
+        ttk.Button(b, text="Testtoon via gekozen uitgang", style="Copper.TButton", command=self.start_tone).pack(anchor="w", pady=10)
+        self.label(b, "Let op: de meetversterking regelt alleen de meter/VOX-test; niet het Windows-opnameniveau of TeamSpeak-volume.")
+        self.label(b, "De testtoon speelt kort af via de geselecteerde audio-uitgang. Zet het volume laag als een radiozender is aangesloten.")
 
     def vox_page(self):
-        box = self.card(
-            self.pages["VOX-instellingen"],
-            "VOX — testinstellingen"
-        )
-
-        sliders = [
-            (
-                "VOX-drempel (%)",
-                "threshold",
-                1,
-                100
-            ),
-            (
-                "Triggertijd (ms)",
-                "attack_ms",
-                0,
-                2000
-            ),
-            (
-                "Afvaltijd (ms)",
-                "release_ms",
-                100,
-                5000
-            )
-        ]
-
-        for title, key, low, high in sliders:
-            self.slider(
-                box,
-                title,
-                key,
-                low,
-                high
-            )
-
-        self.note(
-            box,
-            "De VOX is voorlopig een lokale test. "
-            "Deze schakelt de TeamSpeak-microfoon "
-            "nog niet in of uit."
-        )
-
-        ttk.Button(
-            box,
-            text="Instellingen bewaren",
-            command=self.save
-        ).pack(
-            anchor="w",
-            pady=10
-        )
-
-    # ======================================
-    # RADIOMODUS
-    # ======================================
+        b = self.card("VOX-instellingen", "VOX-test")
+        for title, key, lo, hi in (("VOX-drempel (%)", "threshold", 1, 100), ("Triggertijd (ms)", "attack", 0, 2000), ("Afvaltijd (ms)", "release", 100, 5000)):
+            self.slider(b, title, key, lo, hi)
+        self.label(b, "Deze VOX bestuurt nog niet de microfoon van TeamSpeak. Stel daarvoor momenteel ook Voice Activation Detection in TeamSpeak in.")
 
     def mode_page(self):
-        box = self.card(
-            self.pages["Radiomodus"],
-            "RX / TX / RX-TX"
-        )
-
-        modes = [
-            (
-                "RX — alleen ontvanger",
-                "RX"
-            ),
-            (
-                "TX — alleen zender",
-                "TX"
-            ),
-            (
-                "RX/TX — gateway",
-                "RX/TX"
-            )
-        ]
-
-        for label, value in modes:
-            tk.Radiobutton(
-                box,
-                text=label,
-                value=value,
-                variable=self.vars["mode"],
-                bg=PANEL,
-                fg=TEXT,
-                activebackground=PANEL,
-                activeforeground=TEXT,
-                selectcolor="#654125",
-                font=("Segoe UI", 11)
-            ).pack(
-                anchor="w",
-                pady=8
-            )
-
-        self.note(
-            box,
-            "De gekozen radiomodus wordt opgeslagen. "
-            "Het daadwerkelijke routeren van radio-audio "
-            "wordt later aangesloten."
-        )
-
-        ttk.Button(
-            box,
-            text="Instellingen bewaren",
-            command=self.save
-        ).pack(
-            anchor="w",
-            pady=10
-        )
-
-    # ======================================
-    # SYSTEEM
-    # ======================================
+        b = self.card("Radiomodus", "Modus opslaan (nog geen audiobrug)")
+        for label, value in (("RX — ontvanger", "RX"), ("TX — zender", "TX"), ("RX/TX — gateway", "RX/TX")):
+            tk.Radiobutton(b, text=label, value=value, variable=self.v["mode"], bg=COL["card"], fg=COL["fg"], selectcolor="#765030", activebackground=COL["card"], activeforeground=COL["fg"]).pack(anchor="w", pady=7)
+        self.label(b, "De gekozen modus wordt bewaard, maar stuurt in deze versie nog geen spraak naar of van TeamSpeak.")
 
     def system(self):
-        box = self.card(
-            self.pages["Systeem"],
-            "Programma-informatie"
-        )
+        b = self.card("Systeem", "Instellingen")
+        self.label(b, "Instellingenbestand: " + str(PATH))
+        ttk.Button(b, text="Instellingen opslaan", style="Copper.TButton", command=self.save).pack(anchor="w", pady=10)
+        self.label(b, "TeamSpeak opent extern. USB-audio en VOX-test werken lokaal.")
 
-        self.note(
-            box,
-            "PTT Connect Radio Gateway — "
-            "Windows Copper Edition"
-        )
-
-        self.note(
-            box,
-            "TeamSpeak-linktest: opent de "
-            "geïnstalleerde TeamSpeak-client."
-        )
-
-        self.note(
-            box,
-            "Lokale testfuncties: "
-            "audio-ingang, audiometer en VOX."
-        )
-
-        self.note(
-            box,
-            "Instellingenbestand: " + str(SETTINGS)
-        )
-
-        ttk.Button(
-            box,
-            text="Alles opslaan",
-            style="Copper.TButton",
-            command=self.save
-        ).pack(
-            anchor="w",
-            pady=10
-        )
-
-    # ======================================
-    # LINKERMENU
-    # ======================================
-
-    def show(self, name):
-        for page in self.pages.values():
-            page.pack_forget()
-
-        self.pages[name].pack(
-            fill="both",
-            expand=True
-        )
-
-        self.heading.config(
-            text=name
-        )
-
-        for n, btn in self.nav.items():
-            btn.config(
-                bg="#885022" if n == name else SIDE
-            )
-
-    # ======================================
-    # INSTELLINGEN OPSLAAN
-    # ======================================
-
-    def save(self):
-        try:
-            SETTINGS.parent.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            SETTINGS.write_text(
-                json.dumps(
-                    {
-                        k: v.get()
-                        for k, v in self.vars.items()
-                    },
-                    ensure_ascii=False,
-                    indent=2
-                ),
-                encoding="utf8"
-            )
-
-            messagebox.showinfo(
-                "Opgeslagen",
-                "Instellingen zijn opgeslagen."
-            )
-
-        except Exception as exc:
-            messagebox.showerror(
-                "Opslaan mislukt",
-                str(exc)
-            )
-
-    # ======================================
-    # TEAMSPEAK OPENEN
-    # ======================================
-
-    def connect(self):
-        server_name = self.vars["server"].get()
-
-        host = SERVERS.get(server_name)
-
-        if not host:
-            messagebox.showerror(
-                "TeamSpeak",
-                "Selecteer eerst een TeamSpeak-server."
-            )
-            return
-
-        try:
-            port = int(
-                self.vars["voice_port"].get()
-            )
-
-            if not 1 <= port <= 65535:
-                raise ValueError()
-
-        except ValueError:
-            messagebox.showerror(
-                "TeamSpeak",
-                "Vul een geldige spraakpoort in."
-            )
-            return
-
-        nickname = (
-            self.vars["nickname"].get().strip()
-        )
-
-        if len(nickname) < 3:
-            messagebox.showerror(
-                "TeamSpeak",
-                "Gebruikersnaam moet minimaal "
-                "3 tekens bevatten."
-            )
-            return
-
-        params = {
-            "port": port,
-            "nickname": nickname
-        }
-
-        channel = (
-            self.vars["channel"].get().strip()
-        )
-
-        if channel:
-            params["channel"] = channel
-
-        uri = (
-            "ts3server://"
-            + host
-            + "?"
-            + urlencode(params)
-        )
-
-        try:
-            os.startfile(uri)
-
-        except (OSError, AttributeError) as exc:
-            messagebox.showerror(
-                "TeamSpeak",
-                "Kan TeamSpeak niet openen.\n\n"
-                "Controleer of TeamSpeak 3 is "
-                "geïnstalleerd en of ts3server-links "
-                "zijn geregistreerd.\n\n"
-                + str(exc)
-            )
-            return
-
-        self.ts_status.config(
-            text=(
-                "TeamSpeak-openverzoek verstuurd voor "
-                + server_name
-                + ". Controleer in TeamSpeak "
-                  "of je verbonden bent."
-            )
-        )
-
-    # ======================================
-    # GELUIDSKAARTEN
-    # ======================================
+    def page(self, name):
+        for p in self.pages.values():
+            p.pack_forget()
+        self.pages[name].pack(fill="both", expand=True)
+        self.title.config(text=name)
+        for n, btn in self.buttons.items():
+            btn.config(bg="#885022" if n == name else COL["side"])
 
     def refresh_devices(self):
-        if sd is None:
-            return
-
         try:
-            devices = sd.query_devices()
-
-            self.inputs = {
-                f'{i}: {d["name"]}': i
-                for i, d in enumerate(devices)
-                if d["max_input_channels"] > 0
-            }
-
-            self.outputs = {
-                f'{i}: {d["name"]}': i
-                for i, d in enumerate(devices)
-                if d["max_output_channels"] > 0
-            }
-
-            options = [
-                (
-                    "input_device",
-                    self.in_combo,
-                    self.inputs
-                ),
-                (
-                    "output_device",
-                    self.out_combo,
-                    self.outputs
-                )
-            ]
-
-            for key, combo, mapping in options:
-                combo["values"] = list(mapping)
-
-                if (
-                    self.vars[key].get() not in mapping
-                    and mapping
-                ):
-                    self.vars[key].set(
-                        next(iter(mapping))
-                    )
-
+            found = sd.query_devices()
+            self.devices_in = {f"{i}: {d['name']}": i for i, d in enumerate(found) if d["max_input_channels"] > 0}
+            self.devices_out = {f"{i}: {d['name']}": i for i, d in enumerate(found) if d["max_output_channels"] > 0}
+            for key, combo, items in (("input", self.combo_in, self.devices_in), ("output", self.combo_out, self.devices_out)):
+                combo["values"] = list(items)
+                if self.v[key].get() not in items and items:
+                    self.v[key].set(next(iter(items)))
         except Exception as exc:
-            messagebox.showerror(
-                "Audio",
-                str(exc)
-            )
+            messagebox.showerror("Audioapparaten", str(exc))
 
-    # ======================================
-    # AUDIO TEST
-    # ======================================
-
-    def toggle_audio(self):
-        if self.stream is not None:
-            self.stop_audio()
-            return
-
-        name = (
-            self.vars["input_device"].get()
-        )
-
-        if sd is None or name not in self.inputs:
-            messagebox.showerror(
-                "Audio",
-                "Kies eerst een werkende audio-ingang."
-            )
-            return
-
+    def connect(self):
+        choice = self.v["server"].get()
         try:
-            self.stream = sd.InputStream(
-                device=self.inputs[name],
-                channels=1,
-                samplerate=16000,
-                blocksize=320,
-                dtype="float32",
-                callback=self.on_audio
-            )
+            port = int(self.v["port"].get())
+            if choice not in SERVERS or not 1 <= port <= 65535:
+                raise ValueError("Ongeldige serverkeuze of poort")
+            nick = self.v["nickname"].get().strip()
+            if len(nick) < 3:
+                raise ValueError("Gebruikersnaam moet minimaal 3 tekens hebben")
+            params = {"port": port, "nickname": nick}
+            if self.v["channel"].get().strip():
+                params["channel"] = self.v["channel"].get().strip()
+            uri = "ts3server://" + SERVERS[choice] + "?" + urlencode(params)
+            os.startfile(uri)
+            self.ts_label.config(text="Openverzoek verstuurd. Controleer de verbinding in TeamSpeak.")
+        except Exception as exc:
+            messagebox.showerror("TeamSpeak", str(exc))
 
+    def toggle_monitor(self):
+        if self.stream is not None:
+            self.stop_monitor()
+            return
+        key = self.v["input"].get()
+        if key not in self.devices_in:
+            messagebox.showerror("Audio", "Selecteer eerst een geldige audio-ingang")
+            return
+        try:
+            self.stream = sd.InputStream(device=self.devices_in[key], channels=1, samplerate=16000, blocksize=320, callback=self.audio_cb, dtype="float32")
             self.stream.start()
-
-            self.test_button.config(
-                text="Stop audiotest"
-            )
-
+            self.monitor_btn.config(text="Stop audiotest")
         except Exception as exc:
             if self.stream is not None:
-                try:
-                    self.stream.close()
-                except Exception:
-                    pass
-
+                self.stream.close()
             self.stream = None
+            messagebox.showerror("Audio", str(exc))
 
-            messagebox.showerror(
-                "Audio",
-                str(exc)
-            )
-
-    def on_audio(
-        self,
-        frames,
-        count,
-        time_info,
-        status
-    ):
+    def audio_cb(self, data, frames, time_info, status):
         try:
-            rms = math.sqrt(
-                sum(
-                    float(s[0]) ** 2
-                    for s in frames
-                ) / max(count, 1)
-            )
-
-            self.audio_q.put_nowait(
-                (
-                    rms,
-                    count * 1000.0 / 16000
-                )
-            )
-
+            rms = float(np.sqrt(np.mean(data[:, 0] ** 2)))
+            self.events.put_nowait((rms, frames * 1000 / 16000))
         except queue.Full:
             pass
 
-    # ======================================
-    # AUDIOMETER EN VOX
-    # ======================================
+    def stop_monitor(self):
+        stream, self.stream = self.stream, None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        self.level = self.peak = 0
+        self.vox = False
+        self.high_ms = self.low_ms = 0
+        self.monitor_btn.config(text="Start audiotest")
+        while not self.events.empty():
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                break
+
+    def start_tone(self):
+        if self.tone_running:
+            return
+        key = self.v["output"].get()
+        if key not in self.devices_out:
+            messagebox.showwarning("Audio", "Selecteer eerst een audio-uitgang")
+            return
+        if not messagebox.askyesno("Testtoon", "Speel een korte, zachte testtoon af op de gekozen uitgang?\n\nKoppel eerst eventuele zendapparatuur los of schakel zenden uit."):
+            return
+        self.tone_running = True
+        idx = self.devices_out[key]
+
+        def work():
+            try:
+                sr = 44100
+                t = np.arange(int(sr * .3), dtype=np.float32) / sr
+                edge = np.minimum(1, np.minimum(np.arange(t.size), np.arange(t.size)[::-1]) / (sr * .025))
+                tone = (.06 * np.sin(2 * np.pi * 700 * t) * edge).astype(np.float32)
+                sd.play(tone, samplerate=sr, device=idx, blocking=True)
+            except Exception as exc:
+                if not self.closed:
+                    self.root.after(0, lambda m=str(exc): messagebox.showerror("Testtoon", m))
+            finally:
+                self.tone_running = False
+        threading.Thread(target=work, daemon=True).start()
 
     def tick(self):
         if self.closed:
             return
-
         try:
             while True:
-                rms, ms = (
-                    self.audio_q.get_nowait()
-                )
-
-                self.level = min(
-                    100.0,
-                    rms * float(
-                        self.vars["gain"].get()
-                    )
-                )
-
-                if self.level >= float(
-                    self.vars["threshold"].get()
-                ):
-                    self.above += ms
-                    self.below = 0
-
-                    if self.above >= float(
-                        self.vars["attack_ms"].get()
-                    ):
+                rms, ms = self.events.get_nowait()
+                gain = float(self.v["gain"].get()) / 100
+                self.level = min(100, rms * gain * 100)
+                if self.level >= float(self.v["threshold"].get()):
+                    self.high_ms += ms
+                    self.low_ms = 0
+                    if self.high_ms >= float(self.v["attack"].get()):
                         self.vox = True
-
                 else:
-                    self.below += ms
-                    self.above = 0
-
-                    if self.below >= float(
-                        self.vars["release_ms"].get()
-                    ):
+                    self.low_ms += ms
+                    self.high_ms = 0
+                    if self.low_ms >= float(self.v["release"].get()):
                         self.vox = False
-
         except queue.Empty:
             pass
-
         self.meter["value"] = self.level
+        self.meter_label.config(text=f"Niveau: {self.level:.1f}% | VOX: {'ACTIEF' if self.vox else 'uit'}")
+        self.root.after(70, self.tick)
 
-        self.level_label.config(
-            text=(
-                f"Niveau: {self.level:.1f}% | "
-                f'VOX: {"ACTIEF" if self.vox else "uit"}'
-            )
-        )
-
-        self.root.after(
-            70,
-            self.tick
-        )
-
-    # ======================================
-    # AUDIO STOPPEN
-    # ======================================
-
-    def stop_audio(self):
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-
-            finally:
-                self.stream = None
-
-        self.level = 0.0
-        self.above = 0
-        self.below = 0
-        self.vox = False
-
-        self.test_button.config(
-            text="Start audiotest"
-        )
-
-        while True:
-            try:
-                self.audio_q.get_nowait()
-
-            except queue.Empty:
-                break
-
-    # ======================================
-    # AFSLUITEN
-    # ======================================
+    def save(self):
+        try:
+            PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({k: v.get() for k, v in self.v.items()}, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(PATH)
+            messagebox.showinfo("Opgeslagen", "Instellingen bewaard")
+        except Exception as exc:
+            messagebox.showerror("Fout", str(exc))
 
     def close(self):
         self.closed = True
-
-        self.stop_audio()
-
+        self.stop_monitor()
         try:
-            SETTINGS.parent.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            SETTINGS.write_text(
-                json.dumps(
-                    {
-                        k: v.get()
-                        for k, v in self.vars.items()
-                    },
-                    ensure_ascii=False,
-                    indent=2
-                ),
-                encoding="utf8"
-            )
-
+            PATH.parent.mkdir(parents=True, exist_ok=True)
+            PATH.write_text(json.dumps({k: v.get() for k, v in self.v.items()}, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-
         self.root.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root)
+    GUI(root)
     root.mainloop()

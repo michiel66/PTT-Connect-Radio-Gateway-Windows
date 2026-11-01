@@ -1,13 +1,19 @@
 
+"""PTT Connect Radio Gateway — Windows Copper Edition.
+
+TeamSpeak-verbindingstest via geïnstalleerde TeamSpeak-client.
+De lokale audiometer en VOX zijn nog niet gekoppeld aan TeamSpeak.
+"""
+
 import json
-import math
 import os
+import math
 import queue
-import socket
-import threading
 import tkinter as tk
+
 from pathlib import Path
 from tkinter import ttk, messagebox
+from urllib.parse import urlencode
 
 try:
     import sounddevice as sd
@@ -15,42 +21,7 @@ except ImportError:
     sd = None
 
 
-# ==========================================
-# PTT CONNECT RADIO GATEWAY - WINDOWS
-# Copper Edition - TeamSpeak 3 kanalen
-# ==========================================
-
 APP = "PTT Connect Radio Gateway"
-
-SERVERS = {
-    "TG-103 Voorburg": "ptt.mijnts3.nl",
-    "TG-108 Heerlen": "heerlen.mijnts3.nl"
-}
-
-DATA = Path(
-    os.getenv("APPDATA") or Path.home()
-) / "PTTConnectRadioGateway"
-
-SETTINGS = DATA / "settings.json"
-
-DEFAULT = {
-    "server_choice": "TG-103 Voorburg",
-    "server": "ptt.mijnts3.nl",
-    "query_port": "10011",
-    "voice_port": "9987",
-    "query_user": "",
-    "nickname": "Radio Gateway",
-    "channel": "",
-    "channel_id": "",
-    "input_device": "",
-    "output_device": "",
-    "gain": 100,
-    "threshold": 12,
-    "attack_ms": 150,
-    "release_ms": 950,
-    "mode": "RX/TX",
-    "vox_enabled": True
-}
 
 BG = "#17191c"
 SIDE = "#111315"
@@ -60,251 +31,93 @@ TEXT = "#f6f1e9"
 SUB = "#b5aea5"
 GREEN = "#53cb85"
 
+SERVERS = {
+    "TG-103 Voorburg": "ptt.mijnts3.nl",
+    "TG-108 Heerlen": "heerlen.mijnts3.nl"
+}
 
-# ==========================================
-# INSTELLINGEN
-# ==========================================
+SETTINGS = (
+    Path(os.getenv("APPDATA") or Path.home())
+    / "PTTConnectRadioGateway"
+    / "settings.json"
+)
 
-def load_settings():
-    data = DEFAULT.copy()
+DEFAULT = {
+    "server": "TG-103 Voorburg",
+    "nickname": "Radio Gateway",
+    "channel": "",
+    "voice_port": 9987,
+    "input_device": "",
+    "output_device": "",
+    "gain": 100,
+    "threshold": 12,
+    "attack_ms": 150,
+    "release_ms": 950,
+    "mode": "RX/TX"
+}
 
+
+def load():
     try:
         saved = json.loads(
-            SETTINGS.read_text(encoding="utf-8")
+            SETTINGS.read_text(encoding="utf8")
         )
 
-        if isinstance(saved, dict):
-            data.update({
-                key: value
-                for key, value in saved.items()
-                if key in DEFAULT
-            })
+        return {
+            **DEFAULT,
+            **{
+                k: v
+                for k, v in saved.items()
+                if k in DEFAULT
+            }
+        }
 
     except (OSError, ValueError, TypeError):
-        pass
+        return DEFAULT.copy()
 
-    return data
-
-
-def save_settings(data):
-    DATA.mkdir(parents=True, exist_ok=True)
-
-    temp = SETTINGS.with_suffix(".tmp")
-
-    temp.write_text(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False
-        ),
-        encoding="utf-8"
-    )
-
-    temp.replace(SETTINGS)
-
-
-# ==========================================
-# TEAMSPEAK 3 SERVERQUERY
-# ==========================================
-
-def ts_unescape(value):
-    replacements = {
-        "s": " ",
-        "p": "|",
-        "/": "/",
-        "\\": "\\",
-        "n": "\n",
-        "r": "\r",
-        "t": "\t"
-    }
-
-    result = []
-    i = 0
-
-    while i < len(value):
-        if value[i] == "\\" and i + 1 < len(value):
-            result.append(
-                replacements.get(
-                    value[i + 1],
-                    value[i + 1]
-                )
-            )
-            i += 2
-        else:
-            result.append(value[i])
-            i += 1
-
-    return "".join(result)
-
-
-def ts_escape(value):
-    return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace(" ", "\\s")
-        .replace("|", "\\p")
-        .replace("/", "\\/")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
-
-
-def ts_records(line):
-    records = []
-
-    for part in line.strip().split("|"):
-        record = {}
-
-        for fragment in part.split(" "):
-            if "=" in fragment:
-                key, value = fragment.split("=", 1)
-                record[key] = ts_unescape(value)
-
-        if record:
-            records.append(record)
-
-    return records
-
-
-def query_channels(
-    host,
-    query_port,
-    voice_port,
-    username="",
-    password=""
-):
-    """Alleen-lezen ServerQuery-verbinding."""
-
-    with socket.create_connection(
-        (host, int(query_port)),
-        timeout=7
-    ) as sock:
-
-        sock.settimeout(10)
-        reader = sock.makefile("rb")
-
-        def command(text):
-            sock.sendall(
-                (text + "\n").encode("utf-8")
-            )
-
-            lines = []
-
-            for _ in range(1000):
-                raw = reader.readline()
-
-                if not raw:
-                    raise ConnectionError(
-                        "ServerQuery heeft de verbinding gesloten."
-                    )
-
-                line = raw.decode(
-                    "utf-8", "replace"
-                ).strip()
-
-                if line.startswith("error id="):
-                    error = ts_records(line)
-                    error = error[0] if error else {}
-
-                    if error.get("id") != "0":
-                        raise PermissionError(
-                            error.get(
-                                "msg",
-                                "Geen ServerQuery-toegang"
-                            )
-                        )
-
-                    result = []
-
-                    for item in lines:
-                        result.extend(ts_records(item))
-
-                    return result
-
-                if (
-                    line
-                    and line != "TS3"
-                    and not line.startswith("Welcome to")
-                    and not line.startswith(
-                        "TeamSpeak 3 ServerQuery"
-                    )
-                ):
-                    lines.append(line)
-
-            raise TimeoutError(
-                "ServerQuery gaf te veel regels terug."
-            )
-
-        if username:
-            command(
-                "login client_login_name="
-                + ts_escape(username)
-                + " client_login_password="
-                + ts_escape(password)
-            )
-
-        command("use port=" + str(int(voice_port)))
-
-        channels = command("channellist")
-        clients = command("clientlist")
-
-        return channels, clients
-
-
-# ==========================================
-# WINDOWS DESKTOP APP
-# ==========================================
 
 class App:
 
     def __init__(self, root):
         self.root = root
 
-        root.title(APP + " - Copper Edition")
-        root.geometry("1150x780")
-        root.minsize(950, 650)
-        root.configure(bg=BG)
-
-        data = load_settings()
-
-        self.vars = {
-            key: tk.StringVar(value=str(value))
-            for key, value in data.items()
-            if key != "vox_enabled"
-        }
-
-        self.vox_enabled = tk.BooleanVar(
-            value=bool(data["vox_enabled"])
+        self.root.title(
+            APP + " — Copper Edition"
         )
 
-        self.query_password = tk.StringVar()
-        self.query_events = queue.Queue()
-        self.audio_events = queue.Queue(maxsize=30)
+        self.root.geometry("1070x735")
+        self.root.minsize(900, 600)
+        self.root.configure(bg=BG)
 
-        self.stream = None
-        self.level = 0.0
-        self.vox_active = False
-        self.above_ms = 0
-        self.below_ms = 0
+        self.vars = {
+            k: tk.StringVar(value=str(v))
+            for k, v in load().items()
+        }
+
+        self.pages = {}
+        self.nav = {}
 
         self.inputs = {}
         self.outputs = {}
 
-        self.pages = {}
-        self.nav = {}
-        self.query_busy = False
-        self.closing = False
+        self.stream = None
+        self.audio_q = queue.Queue(maxsize=15)
 
-        self.setup_style()
-        self.build_ui()
-        self.refresh_devices(False)
+        self.level = 0.0
+        self.vox = False
+        self.above = 0
+        self.below = 0
+        self.closed = False
 
-        self.show_page("Overzicht")
+        self._style()
+        self._layout()
+        self.refresh_devices()
 
-        root.after(70, self.update_audio)
-        root.after(100, self.poll_query)
+        self.show("Overzicht")
 
-        root.protocol(
+        self.root.after(70, self.tick)
+
+        self.root.protocol(
             "WM_DELETE_WINDOW",
             self.close
         )
@@ -313,152 +126,125 @@ class App:
     # STIJL
     # ======================================
 
-    def setup_style(self):
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
+    def _style(self):
+        st = ttk.Style(self.root)
+        st.theme_use("clam")
 
-        style.configure(
-            "TEntry",
-            fieldbackground="#faf7f0",
-            padding=7
-        )
-
-        style.configure(
-            "TCombobox",
-            padding=7
-        )
-
-        style.configure(
+        st.configure(
             "TButton",
-            padding=(13, 9),
+            padding=(12, 8),
             font=("Segoe UI", 10, "bold")
         )
 
-        style.configure(
+        st.configure(
             "Copper.TButton",
-            background="#b96522",
-            foreground="white"
+            foreground="white",
+            background="#b96522"
         )
 
-        style.map(
+        st.map(
             "Copper.TButton",
             background=[("active", COPPER)]
         )
 
-        style.configure(
-            "Audio.Horizontal.TProgressbar",
+        st.configure(
+            "TEntry",
+            padding=6,
+            fieldbackground="#faf7f0"
+        )
+
+        st.configure(
+            "TCombobox",
+            padding=6
+        )
+
+        st.configure(
+            "Copper.Horizontal.TProgressbar",
             background=GREEN,
-            troughcolor="#4b3b2b"
-        )
-
-        style.configure(
-            "Dark.Treeview",
-            background="#30353a",
-            foreground=TEXT,
-            fieldbackground="#30353a",
-            rowheight=29,
-            font=("Segoe UI", 10)
-        )
-
-        style.configure(
-            "Dark.Treeview.Heading",
-            background="#885022",
-            foreground="white",
-            font=("Segoe UI", 10, "bold")
-        )
-
-        style.map(
-            "Dark.Treeview",
-            background=[
-                ("selected", "#b96522")
-            ]
+            troughcolor="#49382a"
         )
 
     # ======================================
     # HOOFDVENSTER
     # ======================================
 
-    def build_ui(self):
-        sidebar = tk.Frame(
+    def _layout(self):
+        side = tk.Frame(
             self.root,
             bg=SIDE,
-            width=235
+            width=225
         )
 
-        sidebar.pack(side="left", fill="y")
-        sidebar.pack_propagate(False)
+        side.pack(
+            side="left",
+            fill="y"
+        )
+
+        side.pack_propagate(False)
 
         tk.Label(
-            sidebar,
+            side,
             text="◉ PTT Connect",
             bg=SIDE,
             fg=TEXT,
-            font=("Segoe UI", 19, "bold")
+            font=("Segoe UI", 18, "bold")
         ).pack(
             anchor="w",
-            padx=18,
-            pady=(25, 0)
+            padx=16,
+            pady=(24, 0)
         )
 
         tk.Label(
-            sidebar,
+            side,
             text="RADIO GATEWAY",
             bg=SIDE,
             fg="#ffb347",
-            font=("Segoe UI", 11, "bold")
+            font=("Segoe UI", 10, "bold")
         ).pack(
             anchor="w",
             padx=20,
-            pady=(0, 30)
+            pady=(0, 28)
         )
 
-        menus = [
-            ("Overzicht", "▣"),
-            ("TeamSpeak", "◉"),
-            ("Audioapparaten", "◖"),
-            ("VOX-instellingen", "◎"),
-            ("Radiomodus", "⚙"),
-            ("Systeem", "◈")
+        menu_items = [
+            "Overzicht",
+            "TeamSpeak",
+            "Audioapparaten",
+            "VOX-instellingen",
+            "Radiomodus",
+            "Systeem"
         ]
 
-        for name, symbol in menus:
-            button = tk.Button(
-                sidebar,
-                text=f"{symbol}   {name}",
+        for name in menu_items:
+            btn = tk.Button(
+                side,
+                text="  " + name,
                 bg=SIDE,
                 fg=TEXT,
                 bd=0,
-                anchor="w",
-                padx=16,
+                padx=13,
                 pady=13,
+                anchor="w",
                 font=("Segoe UI", 11),
                 activebackground="#885022",
                 activeforeground="white",
-                cursor="hand2",
-                command=lambda n=name: self.show_page(n)
+                command=lambda n=name: self.show(n)
             )
 
-            button.pack(
+            btn.pack(
                 fill="x",
-                padx=9,
+                padx=8,
                 pady=3
             )
 
-            self.nav[name] = button
+            self.nav[name] = btn
 
-        tk.Label(
-            sidebar,
-            text="WINDOWS DESKTOP",
-            bg=SIDE,
-            fg="#d89a64"
-        ).pack(
-            side="bottom",
-            pady=25
+        right = tk.Frame(
+            self.root,
+            bg=BG
         )
 
-        right = tk.Frame(self.root, bg=BG)
         right.pack(
-            side="left",
             fill="both",
             expand=True
         )
@@ -466,46 +252,56 @@ class App:
         header = tk.Frame(
             right,
             bg="#24272a",
-            height=90
+            height=85
         )
 
         header.pack(fill="x")
         header.pack_propagate(False)
 
-        self.title = tk.Label(
+        self.heading = tk.Label(
             header,
             bg="#24272a",
             fg=TEXT,
             font=("Segoe UI", 21, "bold")
         )
 
-        self.title.pack(
+        self.heading.pack(
             anchor="w",
-            padx=25,
+            padx=24,
             pady=(15, 0)
         )
 
         tk.Label(
             header,
-            text="PTT Connect Radio Gateway • Copper Edition",
+            text=(
+                "Windows • TeamSpeak-verbindingstest "
+                "• Copper Edition"
+            ),
             bg="#24272a",
             fg="#ffc47d"
-        ).pack(anchor="w", padx=27)
+        ).pack(
+            anchor="w",
+            padx=26
+        )
 
-        outer = tk.Frame(right, bg=BG)
-        outer.pack(
+        wrapper = tk.Frame(
+            right,
+            bg=BG
+        )
+
+        wrapper.pack(
             fill="both",
             expand=True
         )
 
         canvas = tk.Canvas(
-            outer,
+            wrapper,
             bg=BG,
             highlightthickness=0
         )
 
         scroll = ttk.Scrollbar(
-            outer,
+            wrapper,
             orient="vertical",
             command=canvas.yview
         )
@@ -514,23 +310,31 @@ class App:
             yscrollcommand=scroll.set
         )
 
-        scroll.pack(side="right", fill="y")
+        scroll.pack(
+            side="right",
+            fill="y"
+        )
+
         canvas.pack(
             side="left",
             fill="both",
             expand=True
         )
 
-        self.body = tk.Frame(canvas, bg=BG)
-        window = canvas.create_window(
-            (0, 0),
-            window=self.body,
-            anchor="nw"
+        body = tk.Frame(
+            canvas,
+            bg=BG
         )
 
-        self.body.bind(
+        window = canvas.create_window(
+            (0, 0),
+            anchor="nw",
+            window=body
+        )
+
+        body.bind(
             "<Configure>",
-            lambda e: canvas.configure(
+            lambda _: canvas.configure(
                 scrollregion=canvas.bbox("all")
             )
         )
@@ -545,67 +349,81 @@ class App:
 
         for name in self.nav:
             self.pages[name] = tk.Frame(
-                self.body,
+                body,
                 bg=BG
             )
 
-        self.build_overview()
-        self.build_teamspeak()
-        self.build_audio_page()
-        self.build_vox_page()
-        self.build_radio_page()
-        self.build_system_page()
+        self.overview()
+        self.teamspeak()
+        self.audio()
+        self.vox_page()
+        self.mode_page()
+        self.system()
 
-    def card(self, page, heading):
-        box = tk.Frame(
+    # ======================================
+    # ALGEMENE COMPONENTEN
+    # ======================================
+
+    def card(self, page, title):
+        frame = tk.Frame(
             page,
             bg=PANEL,
-            highlightbackground="#76512f",
             highlightthickness=1,
+            highlightbackground="#76512f",
             padx=20,
             pady=18
         )
 
-        box.pack(
+        frame.pack(
             fill="x",
             padx=20,
-            pady=(15, 3)
+            pady=(16, 0)
         )
 
         tk.Label(
-            box,
-            text=heading,
+            frame,
+            text=title,
             bg=PANEL,
             fg="#ffb347",
             font=("Segoe UI", 14, "bold")
         ).pack(
             anchor="w",
-            pady=(0, 13)
+            pady=(0, 12)
         )
 
-        return box
+        return frame
 
-    def note(self, parent, text):
+    def note(self, page, txt, color=SUB):
         tk.Label(
-            parent,
-            text=text,
+            page,
+            text=txt,
             bg=PANEL,
-            fg=SUB,
-            anchor="w",
+            fg=color,
+            font=("Segoe UI", 10),
             justify="left",
             wraplength=690
-        ).pack(anchor="w", pady=6)
+        ).pack(
+            anchor="w",
+            pady=7
+        )
 
-    def field(self, parent, label, key):
-        line = tk.Frame(parent, bg=PANEL)
-        line.pack(fill="x", pady=6)
+    def entry(self, page, label, key):
+        line = tk.Frame(
+            page,
+            bg=PANEL
+        )
+
+        line.pack(
+            fill="x",
+            pady=6
+        )
 
         tk.Label(
             line,
             text=label,
             bg=PANEL,
             fg=TEXT,
-            width=20,
+            width=19,
             anchor="w"
         ).pack(side="left")
 
@@ -618,42 +436,45 @@ class App:
             expand=True
         )
 
-    def slider(self, parent, label, key, low, high):
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x", pady=7)
+    def slider(self, parent, title, key, low, high):
+        line = tk.Frame(
+            parent,
+            bg=PANEL
+        )
+
+        line.pack(
+            fill="x",
+            pady=5
+        )
 
         tk.Label(
-            row,
-            text=label,
+            line,
+            text=title,
             bg=PANEL,
             fg=TEXT,
             width=22,
             anchor="w"
         ).pack(side="left")
 
-        control = tk.Scale(
-            row,
+        scale = tk.Scale(
+            line,
             from_=low,
             to=high,
             orient="horizontal",
+            length=300,
             bg=PANEL,
             fg=TEXT,
             troughcolor="#b96522",
-            activebackground=COPPER,
             highlightthickness=0,
-            length=320,
-            resolution=1,
             command=lambda value, k=key:
-                self.vars[k].set(
-                    str(int(float(value)))
-                )
+                self.vars[k].set(str(int(float(value))))
         )
 
-        control.set(
-            int(float(self.vars[key].get()))
+        scale.set(
+            int(self.vars[key].get())
         )
 
-        control.pack(
+        scale.pack(
             side="left",
             fill="x",
             expand=True
@@ -663,402 +484,205 @@ class App:
     # OVERZICHT
     # ======================================
 
-    def build_overview(self):
-        page = self.pages["Overzicht"]
-
-        box = self.card(page, "Systeemstatus")
-
-        self.monitor_status = tk.Label(
-            box,
-            text="Audio-ingang: niet actief",
-            bg=PANEL,
-            fg=GREEN,
-            font=("Segoe UI", 12, "bold")
+    def overview(self):
+        box = self.card(
+            self.pages["Overzicht"],
+            "Live audio — ingangstest"
         )
-
-        self.monitor_status.pack(anchor="w")
-
-        self.note(
-            box,
-            "TeamSpeak-spraakverbinding: nog niet actief."
-        )
-
-        audio = self.card(page, "Live audiometer")
 
         self.meter = ttk.Progressbar(
-            audio,
-            style="Audio.Horizontal.TProgressbar",
+            box,
+            style="Copper.Horizontal.TProgressbar",
             maximum=100
         )
 
-        self.meter.pack(fill="x", pady=12)
+        self.meter.pack(
+            fill="x",
+            pady=10
+        )
 
-        self.meter_label = tk.Label(
-            audio,
-            text="Niveau: 0% | VOX: uit",
+        self.level_label = tk.Label(
+            box,
+            text="Niveau: 0,0% | VOX: uit",
             bg=PANEL,
             fg=GREEN,
             font=("Segoe UI", 12, "bold")
         )
 
-        self.meter_label.pack(anchor="w")
+        self.level_label.pack(anchor="w")
 
-        self.monitor_button = ttk.Button(
-            audio,
+        self.test_button = ttk.Button(
+            box,
             text="Start audiotest",
             style="Copper.TButton",
-            command=self.toggle_monitor
+            command=self.toggle_audio
         )
 
-        self.monitor_button.pack(
+        self.test_button.pack(
             anchor="w",
-            pady=14
+            pady=12
         )
 
         self.note(
-            audio,
-            "De audiotest gebruikt de geselecteerde "
-            "microfoon of USB-geluidskaart."
+            box,
+            "De audiometer en VOX zijn lokaal. "
+            "Dit is nog geen zelfstandige TeamSpeak-gateway."
+        )
+
+        status = self.card(
+            self.pages["Overzicht"],
+            "Verbindingsstatus"
+        )
+
+        self.note(
+            status,
+            "TeamSpeak kan worden geopend met de "
+            "geïnstalleerde TeamSpeak-client."
+        )
+
+        self.note(
+            status,
+            "Een zelfstandige TeamSpeak-audioconnector "
+            "bouwen we in een volgende stap."
         )
 
     # ======================================
     # TEAMSPEAK
     # ======================================
 
-    def build_teamspeak(self):
-        page = self.pages["TeamSpeak"]
-
+    def teamspeak(self):
         box = self.card(
-            page,
-            "TeamSpeak 3 — Server en kanaal"
+            self.pages["TeamSpeak"],
+            "TeamSpeak 3 — Handmatig verbinden"
         )
 
-        self.note(box, "Selecteer een TeamSpeak-server.")
-
-        self.server_combo = ttk.Combobox(
+        self.note(
             box,
-            textvariable=self.vars["server_choice"],
+            "Kies TG-103 Voorburg of TG-108 Heerlen."
+        )
+
+        ttk.Combobox(
+            box,
+            textvariable=self.vars["server"],
             values=list(SERVERS),
             state="readonly"
-        )
-
-        self.server_combo.pack(
-            fill="x",
-            pady=7
-        )
-
-        self.server_combo.bind(
-            "<<ComboboxSelected>>",
-            self.change_server
-        )
-
-        self.field(box, "Serveradres", "server")
-        self.field(box, "Gebruikersnaam", "nickname")
-        self.field(box, "Spraakpoort", "voice_port")
-        self.field(box, "ServerQuery-poort", "query_port")
-        self.field(box, "Query-gebruikersnaam", "query_user")
-
-        line = tk.Frame(box, bg=PANEL)
-        line.pack(fill="x", pady=5)
-
-        tk.Label(
-            line,
-            text="Query-wachtwoord",
-            bg=PANEL,
-            fg=TEXT,
-            width=20,
-            anchor="w"
-        ).pack(side="left")
-
-        ttk.Entry(
-            line,
-            textvariable=self.query_password,
-            show="*"
         ).pack(
-            side="left",
             fill="x",
-            expand=True
+            pady=8
+        )
+
+        self.entry(
+            box,
+            "Gebruikersnaam",
+            "nickname"
+        )
+
+        self.entry(
+            box,
+            "Kanaalnaam (optioneel)",
+            "channel"
+        )
+
+        self.entry(
+            box,
+            "Spraakpoort",
+            "voice_port"
         )
 
         self.note(
             box,
-            "Query-inloggegevens zijn optioneel. "
-            "Het Query-wachtwoord wordt niet opgeslagen."
+            "Vul eventueel de exacte kanaalnaam in. "
+            "Een beveiligd kanaal kan een wachtwoord vragen."
         )
 
-        self.query_button = ttk.Button(
+        row = tk.Frame(
             box,
-            text="Kanalen ophalen",
-            style="Copper.TButton",
-            command=self.fetch_channels
+            bg=PANEL
         )
 
-        self.query_button.pack(
+        row.pack(
             anchor="w",
-            pady=10
+            pady=12
         )
-
-        columns = ("id", "name", "users")
-
-        self.channels = ttk.Treeview(
-            box,
-            columns=columns,
-            show="headings",
-            height=9,
-            style="Dark.Treeview",
-            selectmode="browse"
-        )
-
-        self.channels.heading("id", text="ID")
-        self.channels.heading("name", text="Kanaalnaam")
-        self.channels.heading("users", text="Gebruikers")
-
-        self.channels.column(
-            "id", width=65, stretch=False
-        )
-        self.channels.column(
-            "name", width=330
-        )
-        self.channels.column(
-            "users", width=95, stretch=False
-        )
-
-        self.channels.pack(
-            fill="both",
-            expand=True,
-            pady=10
-        )
-
-        self.channels.bind(
-            "<<TreeviewSelect>>",
-            self.select_channel
-        )
-
-        self.query_status = tk.Label(
-            box,
-            text="Nog geen kanalen opgehaald.",
-            bg=PANEL,
-            fg="#ffb347",
-            wraplength=680,
-            justify="left"
-        )
-
-        self.query_status.pack(anchor="w", pady=7)
-
-        self.field(box, "Gekozen kanaal", "channel")
 
         ttk.Button(
-            box,
-            text="Gekozen kanaal bewaren",
-            command=self.save_current
-        ).pack(anchor="w", pady=9)
-
-        buttons = tk.Frame(box, bg=PANEL)
-        buttons.pack(anchor="w", pady=10)
-
-        ttk.Button(
-            buttons,
-            text="Verbinden",
+            row,
+            text="Verbinden via TeamSpeak",
             style="Copper.TButton",
             command=self.connect
-        ).pack(side="left", padx=(0, 10))
-
-        ttk.Button(
-            buttons,
-            text="Verbreken",
-            command=self.disconnect
-        ).pack(side="left")
-
-        self.connection_status = tk.Label(
-            box,
-            text="Status: niet verbonden",
-            bg=PANEL,
-            fg="#ffb347"
+        ).pack(
+            side="left",
+            padx=(0, 8)
         )
 
-        self.connection_status.pack(anchor="w", pady=6)
+        ttk.Button(
+            row,
+            text="Instellingen bewaren",
+            command=self.save
+        ).pack(side="left")
+
+        self.ts_status = tk.Label(
+            box,
+            text="Nog niet gestart",
+            bg=PANEL,
+            fg="#ffb347",
+            justify="left",
+            wraplength=680
+        )
+
+        self.ts_status.pack(
+            anchor="w",
+            pady=8
+        )
 
         self.note(
             box,
-            "De kanalenlijst gebruikt ServerQuery. "
-            "De echte spraakverbinding wordt later toegevoegd."
-        )
-
-    def change_server(self, event=None):
-        choice = self.vars["server_choice"].get()
-
-        if choice in SERVERS:
-            self.vars["server"].set(SERVERS[choice])
-
-        self.vars["channel"].set("")
-        self.vars["channel_id"].set("")
-
-        for row in self.channels.get_children():
-            self.channels.delete(row)
-
-        self.query_status.config(
-            text="Server gewijzigd. Klik op Kanalen ophalen."
-        )
-
-    def fetch_channels(self):
-        if self.query_busy:
-            return
-
-        host = self.vars["server"].get().strip()
-        query_port = self.vars["query_port"].get()
-        voice_port = self.vars["voice_port"].get()
-        user = self.vars["query_user"].get()
-        password = self.query_password.get()
-
-        if not host:
-            messagebox.showwarning(
-                "TeamSpeak",
-                "Vul eerst een serveradres in."
-            )
-            return
-
-        self.query_busy = True
-        self.query_button.config(state="disabled")
-        self.query_status.config(
-            text="Kanalen worden opgehaald..."
-        )
-
-        def worker():
-            try:
-                result = query_channels(
-                    host,
-                    query_port,
-                    voice_port,
-                    user,
-                    password
-                )
-
-                self.query_events.put(
-                    ("success", result)
-                )
-
-            except Exception as exc:
-                self.query_events.put(
-                    ("error", str(exc))
-                )
-
-        threading.Thread(
-            target=worker,
-            daemon=True
-        ).start()
-
-    def poll_query(self):
-        if self.closing:
-            return
-
-        try:
-            while True:
-                status, result = self.query_events.get_nowait()
-
-                self.query_busy = False
-                self.query_button.config(state="normal")
-
-                if status == "error":
-                    self.query_status.config(
-                        text="Kanalen ophalen mislukt: " + result
-                    )
-                    continue
-
-                channels, clients = result
-
-                for item in self.channels.get_children():
-                    self.channels.delete(item)
-
-                counts = {}
-
-                for client in clients:
-                    if client.get("client_type") == "0":
-                        cid = client.get("cid", "")
-                        counts[cid] = counts.get(cid, 0) + 1
-
-                for channel in sorted(
-                    channels,
-                    key=lambda c: int(c.get("cid", "0"))
-                ):
-                    cid = channel.get("cid", "")
-                    name = channel.get(
-                        "channel_name", "(zonder naam)"
-                    )
-
-                    self.channels.insert(
-                        "",
-                        "end",
-                        values=(
-                            cid,
-                            name,
-                            counts.get(cid, 0)
-                        )
-                    )
-
-                self.query_status.config(
-                    text=f"{len(channels)} kanalen opgehaald."
-                )
-
-        except queue.Empty:
-            pass
-
-        self.root.after(100, self.poll_query)
-
-    def select_channel(self, event=None):
-        selected = self.channels.selection()
-
-        if not selected:
-            return
-
-        cid, name, users = self.channels.item(
-            selected[0], "values"
-        )
-
-        self.vars["channel"].set(str(name))
-        self.vars["channel_id"].set(str(cid))
-
-        self.query_status.config(
-            text=f"Geselecteerd: {name} (ID {cid})"
-        )
-
-    def connect(self):
-        messagebox.showinfo(
-            "TeamSpeak",
-            "De server en het gekozen kanaal "
-            "kunnen worden opgeslagen.\n\n"
-            "De echte TeamSpeak-spraakclient "
-            "is nog niet ingebouwd.\n\n"
-            "Er wordt nog geen spraakverbinding gemaakt."
-        )
-
-    def disconnect(self):
-        self.connection_status.config(
-            text="Status: niet verbonden"
+            "Dit opent de geïnstalleerde TeamSpeak-app "
+            "op Windows. Verbreken doe je voorlopig "
+            "in TeamSpeak zelf.",
+            "#ffb347"
         )
 
     # ======================================
     # AUDIOAPPARATEN
     # ======================================
 
-    def build_audio_page(self):
+    def audio(self):
         box = self.card(
             self.pages["Audioapparaten"],
-            "Geluidskaart instellen"
+            "Interne of USB-geluidskaart"
         )
 
-        for label, key, attr in [
-            ("Audio-ingang", "input_device", "input_combo"),
-            ("Audio-uitgang", "output_device", "output_combo")
-        ]:
-            line = tk.Frame(box, bg=PANEL)
-            line.pack(fill="x", pady=9)
+        audio_options = [
+            (
+                "Audio-ingang",
+                "input_device",
+                "in_combo"
+            ),
+            (
+                "Audio-uitgang",
+                "output_device",
+                "out_combo"
+            )
+        ]
+
+        for title, key, prop in audio_options:
+            line = tk.Frame(
+                box,
+                bg=PANEL
+            )
+
+            line.pack(
+                fill="x",
+                pady=8
+            )
 
             tk.Label(
                 line,
-                text=label,
+                text=title,
                 bg=PANEL,
                 fg=TEXT,
-                width=18,
+                width=19,
                 anchor="w"
             ).pack(side="left")
 
@@ -1074,17 +698,24 @@ class App:
                 expand=True
             )
 
-            setattr(self, attr, combo)
+            setattr(
+                self,
+                prop,
+                combo
+            )
 
         ttk.Button(
             box,
             text="Geluidskaarten vernieuwen",
             command=self.refresh_devices
-        ).pack(anchor="w", pady=12)
+        ).pack(
+            anchor="w",
+            pady=8
+        )
 
         self.slider(
             box,
-            "Ingangsniveau (%)",
+            "Meetversterking (%)",
             "gain",
             0,
             200
@@ -1092,157 +723,139 @@ class App:
 
         self.note(
             box,
-            "Het ingangsniveau beïnvloedt momenteel "
-            "de audiometer en VOX-test."
-        )
-
-        self.note(
-            box,
-            "De audio-uitgang is alvast instelbaar. "
-            "Afspelen van TeamSpeak-audio komt later."
+            "De gekozen ingang werkt voor de lokale "
+            "audiotest. TeamSpeak gebruikt voorlopig "
+            "zijn eigen geluidsinstellingen."
         )
 
         ttk.Button(
             box,
-            text="Instellingen opslaan",
-            command=self.save_current
-        ).pack(anchor="w", pady=12)
-
-    def refresh_devices(self, show_error=True):
-        if sd is None:
-            if show_error:
-                messagebox.showerror(
-                    "Audio",
-                    "De module sounddevice ontbreekt."
-                )
-            return
-
-        try:
-            devices = sd.query_devices()
-
-            self.inputs = {
-                f'{i}: {device["name"]}': i
-                for i, device in enumerate(devices)
-                if device["max_input_channels"] > 0
-            }
-
-            self.outputs = {
-                f'{i}: {device["name"]}': i
-                for i, device in enumerate(devices)
-                if device["max_output_channels"] > 0
-            }
-
-            for key, combo, mapping in [
-                ("input_device", self.input_combo, self.inputs),
-                ("output_device", self.output_combo, self.outputs)
-            ]:
-                combo["values"] = list(mapping)
-
-                if self.vars[key].get() not in mapping:
-                    if mapping:
-                        self.vars[key].set(
-                            next(iter(mapping))
-                        )
-
-        except Exception as exc:
-            if show_error:
-                messagebox.showerror(
-                    "Audioapparaten", str(exc)
-                )
+            text="Instellingen bewaren",
+            command=self.save
+        ).pack(
+            anchor="w",
+            pady=10
+        )
 
     # ======================================
-    # VOX
+    # VOX-INSTELLINGEN
     # ======================================
 
-    def build_vox_page(self):
+    def vox_page(self):
         box = self.card(
             self.pages["VOX-instellingen"],
-            "Voice Activated Transmission"
+            "VOX — testinstellingen"
         )
 
-        tk.Checkbutton(
-            box,
-            text="VOX inschakelen",
-            variable=self.vox_enabled,
-            bg=PANEL,
-            fg=TEXT,
-            selectcolor="#654125",
-            activebackground=PANEL,
-            activeforeground=TEXT
-        ).pack(anchor="w", pady=10)
+        sliders = [
+            (
+                "VOX-drempel (%)",
+                "threshold",
+                1,
+                100
+            ),
+            (
+                "Triggertijd (ms)",
+                "attack_ms",
+                0,
+                2000
+            ),
+            (
+                "Afvaltijd (ms)",
+                "release_ms",
+                100,
+                5000
+            )
+        ]
 
-        self.slider(
-            box, "VOX-drempel (%)",
-            "threshold", 1, 100
-        )
-
-        self.slider(
-            box, "Triggertijd (ms)",
-            "attack_ms", 0, 2000
-        )
-
-        self.slider(
-            box, "Afvaltijd (ms)",
-            "release_ms", 100, 5000
-        )
+        for title, key, low, high in sliders:
+            self.slider(
+                box,
+                title,
+                key,
+                low,
+                high
+            )
 
         self.note(
             box,
-            "Test de VOX via de audiometer op Overzicht. "
-            "Er wordt nog niet uitgezonden."
+            "De VOX is voorlopig een lokale test. "
+            "Deze schakelt de TeamSpeak-microfoon "
+            "nog niet in of uit."
         )
 
         ttk.Button(
             box,
-            text="Instellingen opslaan",
-            command=self.save_current
-        ).pack(anchor="w", pady=10)
+            text="Instellingen bewaren",
+            command=self.save
+        ).pack(
+            anchor="w",
+            pady=10
+        )
 
     # ======================================
     # RADIOMODUS
     # ======================================
 
-    def build_radio_page(self):
+    def mode_page(self):
         box = self.card(
             self.pages["Radiomodus"],
-            "Radio bedrijfsmodus"
+            "RX / TX / RX-TX"
         )
 
-        for title, value in [
-            ("RX - alleen ontvanger", "RX"),
-            ("TX - alleen zender", "TX"),
-            ("RX/TX - gateway", "RX/TX")
-        ]:
+        modes = [
+            (
+                "RX — alleen ontvanger",
+                "RX"
+            ),
+            (
+                "TX — alleen zender",
+                "TX"
+            ),
+            (
+                "RX/TX — gateway",
+                "RX/TX"
+            )
+        ]
+
+        for label, value in modes:
             tk.Radiobutton(
                 box,
-                text=title,
-                variable=self.vars["mode"],
+                text=label,
                 value=value,
+                variable=self.vars["mode"],
                 bg=PANEL,
                 fg=TEXT,
-                selectcolor="#654125",
                 activebackground=PANEL,
                 activeforeground=TEXT,
+                selectcolor="#654125",
                 font=("Segoe UI", 11)
-            ).pack(anchor="w", pady=8)
+            ).pack(
+                anchor="w",
+                pady=8
+            )
 
         self.note(
             box,
-            "De bedrijfsmodus wordt opgeslagen. "
-            "De echte radio-audiobrug is nog niet actief."
+            "De gekozen radiomodus wordt opgeslagen. "
+            "Het daadwerkelijke routeren van radio-audio "
+            "wordt later aangesloten."
         )
 
         ttk.Button(
             box,
-            text="Instellingen opslaan",
-            command=self.save_current
-        ).pack(anchor="w", pady=10)
+            text="Instellingen bewaren",
+            command=self.save
+        ).pack(
+            anchor="w",
+            pady=10
+        )
 
     # ======================================
     # SYSTEEM
     # ======================================
 
-    def build_system_page(self):
+    def system(self):
         box = self.card(
             self.pages["Systeem"],
             "Programma-informatie"
@@ -1250,38 +863,42 @@ class App:
 
         self.note(
             box,
-            "PTT Connect Radio Gateway - Windows Copper Edition"
+            "PTT Connect Radio Gateway — "
+            "Windows Copper Edition"
         )
 
         self.note(
             box,
-            "TeamSpeak 3: TG-103 Voorburg en TG-108 Heerlen."
+            "TeamSpeak-linktest: opent de "
+            "geïnstalleerde TeamSpeak-client."
         )
 
         self.note(
             box,
-            "Instellingen worden opgeslagen in:"
+            "Lokale testfuncties: "
+            "audio-ingang, audiometer en VOX."
         )
-
-        self.note(box, str(SETTINGS))
 
         self.note(
             box,
-            "Gepland: TeamSpeak-spraak, RTL-SDR en crosslink."
+            "Instellingenbestand: " + str(SETTINGS)
         )
 
         ttk.Button(
             box,
-            text="Alle instellingen opslaan",
+            text="Alles opslaan",
             style="Copper.TButton",
-            command=self.save_current
-        ).pack(anchor="w", pady=15)
+            command=self.save
+        ).pack(
+            anchor="w",
+            pady=10
+        )
 
     # ======================================
-    # NAVIGATIE
+    # LINKERMENU
     # ======================================
 
-    def show_page(self, name):
+    def show(self, name):
         for page in self.pages.values():
             page.pack_forget()
 
@@ -1290,28 +907,204 @@ class App:
             expand=True
         )
 
-        self.title.config(text=name)
+        self.heading.config(
+            text=name
+        )
 
-        for title, button in self.nav.items():
-            button.config(
-                bg="#885022" if title == name else SIDE
+        for n, btn in self.nav.items():
+            btn.config(
+                bg="#885022" if n == name else SIDE
             )
 
     # ======================================
-    # AUDIO EN VOX TEST
+    # INSTELLINGEN OPSLAAN
     # ======================================
 
-    def toggle_monitor(self):
-        if self.stream is not None:
-            self.stop_monitor()
+    def save(self):
+        try:
+            SETTINGS.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            SETTINGS.write_text(
+                json.dumps(
+                    {
+                        k: v.get()
+                        for k, v in self.vars.items()
+                    },
+                    ensure_ascii=False,
+                    indent=2
+                ),
+                encoding="utf8"
+            )
+
+            messagebox.showinfo(
+                "Opgeslagen",
+                "Instellingen zijn opgeslagen."
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Opslaan mislukt",
+                str(exc)
+            )
+
+    # ======================================
+    # TEAMSPEAK OPENEN
+    # ======================================
+
+    def connect(self):
+        server_name = self.vars["server"].get()
+
+        host = SERVERS.get(server_name)
+
+        if not host:
+            messagebox.showerror(
+                "TeamSpeak",
+                "Selecteer eerst een TeamSpeak-server."
+            )
             return
 
-        name = self.vars["input_device"].get()
+        try:
+            port = int(
+                self.vars["voice_port"].get()
+            )
+
+            if not 1 <= port <= 65535:
+                raise ValueError()
+
+        except ValueError:
+            messagebox.showerror(
+                "TeamSpeak",
+                "Vul een geldige spraakpoort in."
+            )
+            return
+
+        nickname = (
+            self.vars["nickname"].get().strip()
+        )
+
+        if len(nickname) < 3:
+            messagebox.showerror(
+                "TeamSpeak",
+                "Gebruikersnaam moet minimaal "
+                "3 tekens bevatten."
+            )
+            return
+
+        params = {
+            "port": port,
+            "nickname": nickname
+        }
+
+        channel = (
+            self.vars["channel"].get().strip()
+        )
+
+        if channel:
+            params["channel"] = channel
+
+        uri = (
+            "ts3server://"
+            + host
+            + "?"
+            + urlencode(params)
+        )
+
+        try:
+            os.startfile(uri)
+
+        except (OSError, AttributeError) as exc:
+            messagebox.showerror(
+                "TeamSpeak",
+                "Kan TeamSpeak niet openen.\n\n"
+                "Controleer of TeamSpeak 3 is "
+                "geïnstalleerd en of ts3server-links "
+                "zijn geregistreerd.\n\n"
+                + str(exc)
+            )
+            return
+
+        self.ts_status.config(
+            text=(
+                "TeamSpeak-openverzoek verstuurd voor "
+                + server_name
+                + ". Controleer in TeamSpeak "
+                  "of je verbonden bent."
+            )
+        )
+
+    # ======================================
+    # GELUIDSKAARTEN
+    # ======================================
+
+    def refresh_devices(self):
+        if sd is None:
+            return
+
+        try:
+            devices = sd.query_devices()
+
+            self.inputs = {
+                f'{i}: {d["name"]}': i
+                for i, d in enumerate(devices)
+                if d["max_input_channels"] > 0
+            }
+
+            self.outputs = {
+                f'{i}: {d["name"]}': i
+                for i, d in enumerate(devices)
+                if d["max_output_channels"] > 0
+            }
+
+            options = [
+                (
+                    "input_device",
+                    self.in_combo,
+                    self.inputs
+                ),
+                (
+                    "output_device",
+                    self.out_combo,
+                    self.outputs
+                )
+            ]
+
+            for key, combo, mapping in options:
+                combo["values"] = list(mapping)
+
+                if (
+                    self.vars[key].get() not in mapping
+                    and mapping
+                ):
+                    self.vars[key].set(
+                        next(iter(mapping))
+                    )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Audio",
+                str(exc)
+            )
+
+    # ======================================
+    # AUDIO TEST
+    # ======================================
+
+    def toggle_audio(self):
+        if self.stream is not None:
+            self.stop_audio()
+            return
+
+        name = (
+            self.vars["input_device"].get()
+        )
 
         if sd is None or name not in self.inputs:
-            messagebox.showwarning(
+            messagebox.showerror(
                 "Audio",
-                "Selecteer eerst een geldige audio-ingang."
+                "Kies eerst een werkende audio-ingang."
             )
             return
 
@@ -1327,12 +1120,8 @@ class App:
 
             self.stream.start()
 
-            self.monitor_button.config(
+            self.test_button.config(
                 text="Stop audiotest"
-            )
-
-            self.monitor_status.config(
-                text="Audio-ingang: actief"
             )
 
         except Exception as exc:
@@ -1341,180 +1130,158 @@ class App:
                     self.stream.close()
                 except Exception:
                     pass
+
             self.stream = None
 
             messagebox.showerror(
-                "Audiotest", str(exc)
+                "Audio",
+                str(exc)
             )
 
     def on_audio(
-        self, samples, frames, timing, status
+        self,
+        frames,
+        count,
+        time_info,
+        status
     ):
         try:
             rms = math.sqrt(
                 sum(
-                    float(sample[0]) ** 2
-                    for sample in samples
-                ) / max(frames, 1)
+                    float(s[0]) ** 2
+                    for s in frames
+                ) / max(count, 1)
             )
 
-            try:
-                self.audio_events.put_nowait(
-                    (rms, frames * 1000.0 / 16000.0)
+            self.audio_q.put_nowait(
+                (
+                    rms,
+                    count * 1000.0 / 16000
                 )
-            except queue.Full:
-                pass
+            )
 
-        except Exception:
+        except queue.Full:
             pass
 
-    def update_audio(self):
-        if self.closing:
+    # ======================================
+    # AUDIOMETER EN VOX
+    # ======================================
+
+    def tick(self):
+        if self.closed:
             return
 
         try:
             while True:
-                rms, frame_ms = (
-                    self.audio_events.get_nowait()
-                )
-
-                gain = float(
-                    self.vars["gain"].get()
+                rms, ms = (
+                    self.audio_q.get_nowait()
                 )
 
                 self.level = min(
                     100.0,
-                    rms * gain
+                    rms * float(
+                        self.vars["gain"].get()
+                    )
                 )
 
-                threshold = float(
+                if self.level >= float(
                     self.vars["threshold"].get()
-                )
+                ):
+                    self.above += ms
+                    self.below = 0
 
-                if self.level >= threshold:
-                    self.above_ms += frame_ms
-                    self.below_ms = 0
-
-                    if self.above_ms >= float(
+                    if self.above >= float(
                         self.vars["attack_ms"].get()
                     ):
-                        self.vox_active = True
+                        self.vox = True
 
                 else:
-                    self.below_ms += frame_ms
-                    self.above_ms = 0
+                    self.below += ms
+                    self.above = 0
 
-                    if self.below_ms >= float(
+                    if self.below >= float(
                         self.vars["release_ms"].get()
                     ):
-                        self.vox_active = False
+                        self.vox = False
 
         except queue.Empty:
             pass
 
         self.meter["value"] = self.level
 
-        state = (
-            "ACTIEF"
-            if self.vox_active and self.vox_enabled.get()
-            else "uit"
-        )
-
-        self.meter_label.config(
+        self.level_label.config(
             text=(
-                f"Niveau: {self.level:.1f}% "
-                f"| VOX: {state}"
+                f"Niveau: {self.level:.1f}% | "
+                f'VOX: {"ACTIEF" if self.vox else "uit"}'
             )
         )
 
-        self.root.after(70, self.update_audio)
+        self.root.after(
+            70,
+            self.tick
+        )
 
-    def stop_monitor(self):
+    # ======================================
+    # AUDIO STOPPEN
+    # ======================================
+
+    def stop_audio(self):
         if self.stream is not None:
             try:
                 self.stream.stop()
                 self.stream.close()
-            except Exception:
-                pass
 
-            self.stream = None
+            finally:
+                self.stream = None
 
-        self.level = 0
-        self.vox_active = False
-        self.above_ms = 0
-        self.below_ms = 0
+        self.level = 0.0
+        self.above = 0
+        self.below = 0
+        self.vox = False
 
-        while not self.audio_events.empty():
-            try:
-                self.audio_events.get_nowait()
-            except queue.Empty:
-                break
-
-        self.monitor_button.config(
+        self.test_button.config(
             text="Start audiotest"
         )
 
-        self.monitor_status.config(
-            text="Audio-ingang: niet actief"
-        )
+        while True:
+            try:
+                self.audio_q.get_nowait()
+
+            except queue.Empty:
+                break
 
     # ======================================
-    # OPSLAAN EN AFSLUITEN
+    # AFSLUITEN
     # ======================================
-
-    def current_settings(self):
-        values = {
-            key: value.get()
-            for key, value in self.vars.items()
-        }
-
-        for key in [
-            "gain",
-            "threshold",
-            "attack_ms",
-            "release_ms"
-        ]:
-            values[key] = int(float(values[key]))
-
-        values["vox_enabled"] = (
-            self.vox_enabled.get()
-        )
-
-        return values
-
-    def save_current(self):
-        try:
-            save_settings(
-                self.current_settings()
-            )
-
-            messagebox.showinfo(
-                "Opgeslagen",
-                "Alle instellingen zijn opgeslagen."
-            )
-
-        except Exception as exc:
-            messagebox.showerror(
-                "Opslaan mislukt", str(exc)
-            )
 
     def close(self):
-        self.closing = True
-        self.stop_monitor()
+        self.closed = True
+
+        self.stop_audio()
 
         try:
-            save_settings(
-                self.current_settings()
+            SETTINGS.parent.mkdir(
+                parents=True,
+                exist_ok=True
             )
+
+            SETTINGS.write_text(
+                json.dumps(
+                    {
+                        k: v.get()
+                        for k, v in self.vars.items()
+                    },
+                    ensure_ascii=False,
+                    indent=2
+                ),
+                encoding="utf8"
+            )
+
         except Exception:
             pass
 
         self.root.destroy()
 
-
-# ==========================================
-# START PROGRAMMA
-# ==========================================
 
 if __name__ == "__main__":
     root = tk.Tk()

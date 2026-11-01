@@ -1,0 +1,35 @@
+
+name: Bouw Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Code ophalen
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Afhankelijkheden installeren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Windows EXE bouwen
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name PTT-Connect-Radio-Gateway main.py
+
+      - name: EXE beschikbaar maken
+        uses: actions/upload-artifact@v4
+        with:
+          name: PTT-Connect-Radio-Gateway-Windows
+          path: dist/PTT-Connect-Radio-Gateway.exe
